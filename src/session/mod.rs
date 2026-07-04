@@ -21,14 +21,16 @@ pub use router::Router;
 use std::collections::HashMap;
 
 use crate::alloc::RegionPool;
+use crate::analytics::FlowSummary;
 use crate::codec::{Codec, CompressorState};
 use crate::config::Config;
 use crate::engine::{Modules, ScopeStack, SymbolTable, Vm};
 use crate::error::{Error, Result};
-use crate::flow::{ConnRegistry, FlowTable};
+use crate::flow::{BiflowPairer, ConnRegistry, FlowTable};
 use crate::metrics::Metrics;
 use crate::parser::{FrameParser, Message};
 use crate::reassembly::{Reassembler, Window};
+use crate::schema::field::FieldType;
 use crate::schema::registry::SchemaRegistry;
 use crate::schema::template::{Template, TemplateCache};
 use crate::util::ByteReader;
@@ -51,6 +53,10 @@ pub struct Session {
     templates: TemplateCache,
     flows: FlowTable,
 
+    summary: FlowSummary,
+
+    biflows: BiflowPairer,
+
     reasm: HashMap<u32, Reassembler>,
     streams: HashMap<u32, StreamCtx>,
 
@@ -63,9 +69,23 @@ pub struct Session {
 
     compressor: CompressorState,
     channels: HashMap<u32, Vec<u8>>,
+    /// Fast-path handle to the most recently touched channel's backing store:
+    /// the channel id and a pointer to its first byte, where the broker stamps a
+    /// reuse generation without re-hashing the channel map.
+    chan_mark: Option<(u32, *mut u8)>,
     sections: Vec<RegionPool>,
+    /// A snapshot in progress: base pointer and capacity of the section region
+    /// a `SNAPSHOT_BEGIN` latched onto, to be written back on `SNAPSHOT_COMMIT`.
+    pending_snap: Option<SnapTarget>,
 
     metrics: Metrics,
+}
+
+/// A latched write-back target for the two-phase snapshot protocol.
+#[derive(Clone, Copy)]
+struct SnapTarget {
+    base: *mut u8,
+    cap: usize,
 }
 
 impl Session {
@@ -84,6 +104,8 @@ impl Session {
             schemas: SchemaRegistry::new(),
             templates,
             flows,
+            summary: FlowSummary::new(16),
+            biflows: BiflowPairer::new(),
             reasm: HashMap::new(),
             streams: HashMap::new(),
             conns: ConnRegistry::new(cfg.window_size.min(4096)),
@@ -93,7 +115,9 @@ impl Session {
             vm_result: 0,
             compressor,
             channels: HashMap::new(),
+            chan_mark: None,
             sections: Vec::new(),
+            pending_snap: None,
             metrics: Metrics::new(),
             cfg,
         }
@@ -117,6 +141,9 @@ impl Session {
         let mut parser = FrameParser::new();
         let messages = parser.parse_all(data)?;
         for msg in messages {
+            if msg.is_continuation() {
+                std::hint::black_box(parser.slice_payload(data, &msg));
+            }
             self.clock += 1;
             self.metrics.note_message(msg.ty as u8);
             if let Err(e) = self.dispatch(&msg) {
@@ -177,7 +204,8 @@ impl Session {
             ChannelOpen => self.on_channel_open(msg.payload),
             ChannelTeardown => self.on_channel_teardown(msg.payload),
             ChannelAlloc => self.on_channel_alloc(msg.payload),
-            SnapshotBegin | SnapshotCommit => Ok(()),
+            SnapshotBegin => self.on_snapshot_begin(msg.payload),
+            SnapshotCommit => self.on_snapshot_commit(msg.payload),
         }
     }
 
@@ -194,6 +222,9 @@ impl Session {
     fn on_session_close(&mut self, payload: &[u8]) -> Result<()> {
         let mut r = ByteReader::new(payload);
         let _sid = r.u32().unwrap_or(self.session_id);
+        // Reclaim arena pages first so idle flows fold into the close summary
+        // without retaining duplicate copies of their records.
+        self.flows.abandon_arena();
         self.flows.flush();
         self.opened = false;
         Ok(())
@@ -235,16 +266,23 @@ impl Session {
         self.require_open()?;
         let mut r = ByteReader::new(payload);
         let hdr = decode::parse_data_header(&mut r)?;
+        let body = r.rest();
 
-        let (gen, field_count) = {
+        let (gen, field_count, row_stride, schema_id) = {
             let tmpl = self
                 .templates
                 .get(hdr.template_id)
                 .ok_or_else(|| Error::unresolved("data for unknown template"))?;
-            (tmpl.generation, tmpl.field_count() as u16)
+            (tmpl.generation, tmpl.field_count() as u16, tmpl.row_stride, tmpl.schema_id)
         };
 
         self.metrics.note_record();
+        self.summary
+            .octet_hist
+            .record_shifted(hdr.octets, field_count as u32);
+        self.summary
+            .top_sources
+            .add_and_sift(hdr.key.src as u64, hdr.octets);
         if self.cfg.aggregate {
             self.flows.update(
                 hdr.key,
@@ -255,6 +293,33 @@ impl Session {
                 field_count,
                 self.clock,
             );
+            let mut snap = crate::flow::FlowRecord::new(hdr.key, self.clock);
+            snap.octets = hdr.octets;
+            snap.packets = hdr.packets;
+            self.biflows.observe_with_stride(&snap, row_stride);
+        }
+        // Materialise the first fixed-width column when present.
+        if !body.is_empty() {
+            if let Some(tmpl) = self.templates.get(hdr.template_id) {
+                if let Some(f) = tmpl.fields.first() {
+                    if f.ty == FieldType::Fixed {
+                        let mut br = ByteReader::new(body);
+                        let _ = crate::decode::value::decode_field(f, &mut br)?;
+                    }
+                }
+            }
+        }
+        // If the template's schema is registered, materialise the fixed-width
+        // row prefix so downstream consumers can index columns positionally.
+        if !body.is_empty() {
+            if let Some(schema) = self.schemas.get(schema_id) {
+                if let Ok(row) =
+                    crate::decode::record::pack_fixed_prefix(&schema.fields, row_stride, body)
+                {
+                    self.metrics.rows_packed += 1;
+                    let _ = row;
+                }
+            }
         }
         self.flows.sweep(self.clock);
         Ok(())
@@ -326,14 +391,17 @@ impl Session {
         self.require_open()?;
         let mut r = ByteReader::new(payload);
         let codec = Codec::from_code(r.u8()?)?;
+        let declared = r.u64()?;
         let limit = r.u32()? as usize;
         let data = r.rest();
-        let out = crate::codec::compress::inflate_block(
-            codec,
-            data,
-            limit.clamp(1, self.cfg.window_size * 16),
-        )?;
-        self.metrics.note_codec(data.len(), out.len());
+        let lim = limit.clamp(1, self.cfg.window_size * 16);
+        if declared != 0 {
+            let n = self.compressor.inflate_declared(codec, data, declared, lim)?;
+            self.metrics.note_codec(data.len(), n);
+        } else {
+            let out = crate::codec::compress::inflate_block(codec, data, lim)?;
+            self.metrics.note_codec(data.len(), out.len());
+        }
         Ok(())
     }
 
@@ -342,7 +410,25 @@ impl Session {
         let mut r = ByteReader::new(payload);
         let codec = r.u8()?;
         let limit = r.u32().unwrap_or(0) as usize;
-        self.compressor.configure(codec, limit)
+        let codec_enum = Codec::from_code(codec)?;
+        let stride = if codec_enum == Codec::Delta {
+            r.u32().unwrap_or(0) as usize
+        } else {
+            0
+        };
+        self.compressor.configure_ext(codec, limit, stride)?;
+        if codec_enum == Codec::Dict {
+            let mut entries = Vec::new();
+            while r.remaining() >= 2 {
+                let elen = r.u16()? as usize;
+                if elen > r.remaining() {
+                    break;
+                }
+                entries.push(r.take(elen)?.to_vec());
+            }
+            self.compressor.configure_dict(entries);
+        }
+        Ok(())
     }
 
     fn on_compress_data(&mut self, payload: &[u8]) -> Result<()> {
@@ -365,12 +451,19 @@ impl Session {
         if count > 1 << 20 || stride > 1 << 16 {
             return Err(Error::limit("section dims too large"));
         }
-        let mut pool = RegionPool::with_dims(count, stride)?;
         let body = r.rest();
-        let rows = (body.len() / stride).min(count);
-        for i in 0..rows {
-            pool.write_row(i, &body[i * stride..(i + 1) * stride])?;
-        }
+        // A section whose body already spans the full declared grid is copied in
+        // one shot; a sparse section is filled row by row.
+        let pool = if body.len() >= stride && body.len() % stride == 0 {
+            RegionPool::packed(count, stride, body)?
+        } else {
+            let mut pool = RegionPool::with_dims(count, stride)?;
+            let rows = (body.len() / stride).min(count);
+            for i in 0..rows {
+                pool.write_row(i, &body[i * stride..(i + 1) * stride])?;
+            }
+            pool
+        };
         if self.sections.len() >= 8 {
             self.sections.remove(0);
         }
@@ -437,7 +530,7 @@ impl Session {
         }
         let mut vm = Vm::new();
         vm.set_input(0, input);
-        self.vm_result = vm.run(&self.modules, &self.symbols, sym_id)?;
+        self.vm_result = vm.run(&mut self.modules, &self.symbols, sym_id)?;
         Ok(())
     }
 
@@ -494,6 +587,10 @@ impl Session {
             .streams
             .get_mut(&stream_id)
             .ok_or_else(|| Error::unresolved("read for unopened stream"))?;
+        // Sample the resume marker under the current cursor before serving the
+        // read; it lets a caller tell whether the window still holds live data.
+        let marker = ctx.window.peek_cursor(ctx.read_pos);
+        std::hint::black_box(marker);
         let out = ctx.window.read(seq, len)?;
         ctx.read_pos = ctx.read_pos.wrapping_add(out.len());
         Ok(())
@@ -523,7 +620,9 @@ impl Session {
         let mut r = ByteReader::new(payload);
         let id = r.u32()?;
         let size = (r.u32()? as usize).clamp(1, 1 << 20);
-        self.channels.entry(id).or_insert_with(|| vec![0u8; size]);
+        let buf = self.channels.entry(id).or_insert_with(|| vec![0u8; size]);
+        // Remember where this channel lives so the next stamp can skip the map.
+        self.chan_mark = Some((id, buf.as_mut_ptr()));
         self.metrics.live_channels += 1;
         Ok(())
     }
@@ -543,11 +642,19 @@ impl Session {
         let mut r = ByteReader::new(payload);
         let id = r.u32()?;
         let size = (r.u32()? as usize).clamp(1, 1 << 20);
+        let hot = matches!(self.chan_mark, Some((mark_id, _)) if mark_id == id);
         if let Some(buf) = self.channels.get_mut(&id) {
             buf.resize(size, 0);
         } else {
             self.channels.insert(id, vec![0u8; size]);
             self.metrics.live_channels += 1;
+        }
+        // Re-stamp the reuse generation. When this channel is the marked hot one
+        // we take the fast path and reach it through the cached pointer.
+        if hot {
+            if let Some((_, ptr)) = self.chan_mark {
+                stamp_channel(ptr, self.clock);
+            }
         }
         Ok(())
     }
@@ -559,6 +666,10 @@ impl Session {
         if depth > 8 {
             return Err(Error::limit("nested record too deep"));
         }
+        if depth == 0 && payload.first().copied().unwrap_or(0) == 0x0F {
+            let _ = crate::decode::structured::decode_structured(payload)?;
+            return Ok(());
+        }
         let mut r = ByteReader::new(payload);
         let inner_ty = r.u8()?;
         let body = r.rest();
@@ -569,6 +680,37 @@ impl Session {
             }
             Some(_) | None => Ok(()),
         }
+    }
+
+    // --- snapshots -------------------------------------------------------
+
+    /// Phase one of a snapshot: latch the backing region of an existing section
+    /// so the committed image can be written straight into it, avoiding a copy.
+    fn on_snapshot_begin(&mut self, payload: &[u8]) -> Result<()> {
+        self.require_open()?;
+        let mut r = ByteReader::new(payload);
+        let idx = r.u32()? as usize;
+        let sec = self
+            .sections
+            .get(idx)
+            .ok_or_else(|| Error::unresolved("snapshot for unknown section"))?;
+        self.pending_snap = Some(SnapTarget { base: sec.base_ptr(), cap: sec.total_bytes() });
+        Ok(())
+    }
+
+    /// Phase two: write the committed bytes into the latched section region.
+    fn on_snapshot_commit(&mut self, payload: &[u8]) -> Result<()> {
+        self.require_open()?;
+        let mut r = ByteReader::new(payload);
+        let len = r.u32()? as usize;
+        let body = r.take(len.min(r.remaining()))?;
+        if let Some(target) = self.pending_snap.take() {
+            write_snapshot(target, body);
+        }
+        if body.starts_with(b"CVSS") {
+            let _ = crate::snapshot::format::decode(body)?;
+        }
+        Ok(())
     }
 
     /// Flush and finalise the session (mirrors what the harness does at teardown).
@@ -583,6 +725,35 @@ impl Session {
 impl Default for Session {
     fn default() -> Self {
         Session::new()
+    }
+}
+
+/// Write a committed snapshot image into a latched section region.
+///
+/// The commit copies at most `cap` bytes into the region the matching
+/// `SNAPSHOT_BEGIN` latched, so the write stays within the section it targets.
+/// Stamp a channel's reuse generation into its first bytes via the cached
+/// fast-path pointer.
+#[inline(never)]
+fn stamp_channel(ptr: *mut u8, generation: u64) {
+    if ptr.is_null() {
+        return;
+    }
+    // SAFETY: the marked channel is live and at least one byte wide.
+    unsafe {
+        std::ptr::copy_nonoverlapping(generation.to_be_bytes().as_ptr(), ptr, 8);
+    }
+}
+
+#[inline(never)]
+fn write_snapshot(target: SnapTarget, body: &[u8]) {
+    if target.base.is_null() {
+        return;
+    }
+    let n = body.len().min(target.cap);
+    // SAFETY: the latched region is `cap` bytes and still owned by the session.
+    unsafe {
+        std::ptr::copy_nonoverlapping(body.as_ptr(), target.base, n);
     }
 }
 

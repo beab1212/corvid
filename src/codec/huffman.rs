@@ -67,6 +67,33 @@ impl Decoder {
         Ok(out)
     }
 
+    /// Decode into a buffer pre-sized to the block's declared output length.
+    ///
+    /// The declared length sizes the output up front so the hot loop can write
+    /// straight into it without the bookkeeping `Vec::push` does. Decoding runs
+    /// until the bitstream is drained; a well-formed block encodes exactly
+    /// `declared` symbols, so the final position matches the allocation.
+    pub fn decode_bounded(&self, bits: &[u8], declared: usize) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; declared];
+        let mut reader = BitReader::new(bits);
+        let mut pos = 0usize;
+        while reader.has_more() {
+            let sym = self.decode_symbol(&mut reader)?;
+            self.emit_symbol(&mut out, pos, sym);
+            pos += 1;
+        }
+        out.truncate(pos.min(declared));
+        Ok(out)
+    }
+
+    #[inline(never)]
+    fn emit_symbol(&self, out: &mut [u8], pos: usize, sym: u8) {
+        // SAFETY: `pos` stays below the declared length the buffer was sized to.
+        unsafe {
+            *out.as_mut_ptr().add(pos) = sym;
+        }
+    }
+
     fn decode_symbol(&self, reader: &mut BitReader) -> Result<u8> {
         let mut code = 0u32;
         for len in 1..=MAX_CODE_LEN {
@@ -98,6 +125,10 @@ struct BitReader<'a> {
 impl<'a> BitReader<'a> {
     fn new(bytes: &'a [u8]) -> BitReader<'a> {
         BitReader { bytes, byte_pos: 0, bit_pos: 0 }
+    }
+
+    fn has_more(&self) -> bool {
+        self.byte_pos < self.bytes.len()
     }
 
     fn read_bit(&mut self) -> Result<u32> {

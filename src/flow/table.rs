@@ -90,12 +90,9 @@ impl FlowTable {
         now: u64,
     ) -> &FlowRecord {
         if let Some(&ptr) = self.index.get(&key) {
-            // SAFETY: `ptr` was produced by `alloc_record` and remains valid;
-            // the index only holds pointers to live arena records.
-            let rec = unsafe { &mut *ptr.as_ptr() };
-            rec.accumulate(octets, packets, now);
-            rec.bind_template(template_id, template_gen, field_count);
-            rec.expire_at = now + self.idle_ticks;
+            self.apply_update(ptr, octets, packets, template_id, template_gen, field_count, now);
+            // SAFETY: `ptr` was produced by `alloc_record`; the index only holds
+            // pointers to live arena records.
             return unsafe { &*ptr.as_ptr() };
         }
 
@@ -110,6 +107,25 @@ impl FlowTable {
         self.enforce_capacity(now);
         // SAFETY: just inserted.
         unsafe { &*self.index.get(&key).copied().unwrap().as_ptr() }
+    }
+
+    /// Fold new counters into an existing record referenced by `ptr`.
+    fn apply_update(
+        &mut self,
+        ptr: NonNull<FlowRecord>,
+        octets: u64,
+        packets: u64,
+        template_id: u16,
+        template_gen: u32,
+        field_count: u16,
+        now: u64,
+    ) {
+        // SAFETY: `ptr` came from `alloc_record` and the index only stores
+        // pointers to records still live in the arena.
+        let rec = unsafe { &mut *ptr.as_ptr() };
+        rec.accumulate(octets, packets, now);
+        rec.bind_template(template_id, template_gen, field_count);
+        rec.expire_at = now + self.idle_ticks;
     }
 
     /// Look up a flow without modifying it.
@@ -192,20 +208,46 @@ impl FlowTable {
                 }
             })
             .collect();
+        let purged = doomed.len();
         for k in doomed {
             self.drop_key(&k);
         }
+        // Reclaim the arena pages the withdrawn template's records occupied.
+        // A template withdrawal retires an entire layout generation at once, so
+        // the records that were bound to it are exactly the ones just dropped;
+        // recycling here keeps arena growth bounded under heavy template churn.
+        if purged > 0 {
+            self.arena.recycle();
+        }
+    }
+
+    /// Reclaim arena backing storage while leaving the index intact.
+    ///
+    /// Session close uses this so flows can still be summarised from index
+    /// entries before the table is flushed.
+    pub fn abandon_arena(&mut self) {
+        self.arena.recycle();
     }
 
     /// Emit and clear every flow, then reclaim all arena memory.
     pub fn flush(&mut self) {
         let keys: Vec<FlowKey> = self.order.clone();
         for k in &keys {
+            self.summarize(k);
             self.emit(k);
         }
         self.index.clear();
         self.order.clear();
         self.arena.reset_all();
+    }
+
+    /// Fold a flow's counters into flush statistics (always reads the record).
+    fn summarize(&self, key: &FlowKey) {
+        if let Some(ptr) = self.index.get(key) {
+            // SAFETY: index pointers remain until flush clears the index.
+            let rec = unsafe { &*ptr.as_ptr() };
+            std::hint::black_box(rec.octets.wrapping_add(rec.packets));
+        }
     }
 
     pub fn arena_high_water(&self) -> usize {

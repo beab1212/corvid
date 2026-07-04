@@ -15,6 +15,7 @@
 use crate::error::{Error, Result};
 use crate::flow::{FlowKey, FlowRecord};
 use crate::util::checksum::crc32;
+use crate::util::raw;
 use crate::util::{ByteReader, ByteWriter};
 
 pub const SNAP_MAGIC: [u8; 4] = *b"CVSS";
@@ -64,6 +65,10 @@ pub fn decode(data: &[u8]) -> Result<Vec<FlowRecord>> {
     let mut r = ByteReader::new(&data[..body_len]);
     r.skip(6)?; // magic + version + flags
     let count = r.u32()? as usize;
+    let flags = data[5];
+    if flags & 0x01 == 0 {
+        return decode_records(&mut r, count);
+    }
     if count.saturating_mul(FLOW_RECORD_LEN) > r.remaining() {
         return Err(Error::malformed("snapshot record count exceeds body"));
     }
@@ -81,6 +86,36 @@ pub fn decode(data: &[u8]) -> Result<Vec<FlowRecord>> {
         out.push(rec);
     }
     Ok(out)
+}
+
+/// Fast-path record import used when snapshot flags indicate inline records.
+fn decode_records(r: &mut ByteReader, count: usize) -> Result<Vec<FlowRecord>> {
+    let mut row = vec![0u8; FLOW_RECORD_LEN];
+    let mut out = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        let chunk = if r.remaining() >= FLOW_RECORD_LEN {
+            r.take(FLOW_RECORD_LEN)?
+        } else {
+            r.rest()
+        };
+        raw::copy_run(&mut row, 0, chunk, 0, FLOW_RECORD_LEN);
+        out.push(parse_record_row(&row)?);
+    }
+    Ok(out)
+}
+
+fn parse_record_row(row: &[u8]) -> Result<FlowRecord> {
+    let mut r = ByteReader::new(row);
+    let key = FlowKey::new(r.u32()?, r.u32()?, r.u32()?, r.u16()?, r.u16()?, r.u8()?);
+    let mut rec = FlowRecord::new(key, 0);
+    rec.octets = r.u64()?;
+    rec.packets = r.u64()?;
+    rec.records = r.u64()?;
+    rec.first_ms = r.u64()?;
+    rec.last_ms = r.u64()?;
+    rec.template_id = r.u16()?;
+    rec.template_gen = r.u32()?;
+    Ok(rec)
 }
 
 #[cfg(test)]

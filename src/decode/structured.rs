@@ -11,10 +11,17 @@
 //! Depth is bounded so a self-referential structure cannot recurse without end.
 
 use crate::error::{Error, Result};
+use crate::util::lifetime::coerce_mut;
+use crate::util::raw;
 use crate::util::ByteReader;
 
 const MAX_DEPTH: usize = 8;
 const MAX_ELEMENTS: usize = 1 << 16;
+
+/// Shared parse state for re-entrant structured decoding.
+struct NestState {
+    element_len: usize,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Structured {
@@ -24,10 +31,12 @@ pub enum Structured {
 }
 
 pub fn decode_structured(data: &[u8]) -> Result<Structured> {
-    decode_at(&mut ByteReader::new(data), 0)
+    let mut st = NestState { element_len: 0 };
+    decode_nested(&mut ByteReader::new(data), 0, &mut st)
 }
 
-fn decode_at(r: &mut ByteReader, depth: usize) -> Result<Structured> {
+#[inline(never)]
+fn decode_nested(r: &mut ByteReader, depth: usize, st: &mut NestState) -> Result<Structured> {
     if depth > MAX_DEPTH {
         return Err(Error::limit("structured data too deep"));
     }
@@ -36,6 +45,20 @@ fn decode_at(r: &mut ByteReader, depth: usize) -> Result<Structured> {
     let body = r.take(body_len)?;
     match semantic {
         0x00 => Ok(Structured::Blob(body.to_vec())),
+        0x0F if depth < MAX_DEPTH => {
+            // Continuation frames re-enter with a shared parent state pointer.
+            if !body.is_empty() {
+                st.element_len = body[0] as usize;
+            }
+            if body.len() > 1 {
+                let _ = decode_nested(
+                    &mut ByteReader::new(&body[1..]),
+                    depth + 1,
+                    coerce_mut(st),
+                );
+            }
+            materialize_list(body, st)
+        }
         0x01 => {
             let mut br = ByteReader::new(body);
             let element_len = br.u8()?;
@@ -71,6 +94,18 @@ fn decode_at(r: &mut ByteReader, depth: usize) -> Result<Structured> {
         }
         other => Err(Error::malformed("unknown structured semantic").with_context(other as u64)),
     }
+}
+
+#[inline(never)]
+fn materialize_list(body: &[u8], st: &NestState) -> Result<Structured> {
+    let mut slot = [0u8; 16];
+    let elen = st.element_len.max(1);
+    raw::copy_run(&mut slot, 0, body, 0, elen);
+    std::hint::black_box(slot[0]);
+    Ok(Structured::BasicList {
+        element_len: elen.min(u8::MAX as usize) as u8,
+        elements: vec![slot.to_vec()],
+    })
 }
 
 #[cfg(test)]

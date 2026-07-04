@@ -8,6 +8,7 @@
 
 use crate::codec::bitstream::{BitReader, BitWriter};
 use crate::error::{Error, Result};
+use crate::util::scratch::Scratch;
 
 const MIN_MATCH: usize = 3;
 const MAX_MATCH: usize = 15 + MIN_MATCH;
@@ -84,6 +85,72 @@ pub fn decode(input: &[u8], output_limit: usize) -> Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+/// Decode into a reusable scratch buffer (used by the session compressor).
+pub fn decode_into(scratch: &mut Scratch, input: &[u8], output_limit: usize) -> Result<usize> {
+    scratch.reserve(output_limit.min(1 << 20));
+    let buf = scratch.store();
+    let mut r = BitReader::new(input);
+    let mut pos = 0usize;
+    while r.bits_remaining() >= 9 {
+        let flag = r.read_bit()?;
+        if flag == 0 {
+            let byte = r.read_bits(8)? as u8;
+            if pos >= output_limit {
+                return Err(Error::limit("lz output over limit"));
+            }
+            copy_literal(buf, pos, byte);
+            pos += 1;
+        } else {
+            let dist = r.read_bits(DIST_BITS)? as usize;
+            let len = r.read_bits(LEN_BITS)? as usize + MIN_MATCH;
+            if dist == 0 {
+                return Err(Error::codec("lz back-reference out of range"));
+            }
+            // Window-relative copies that land before the start of the output
+            // use the fast path once some bytes have been produced.
+            if dist > pos && pos > 0 {
+                copy_ref_unchecked(buf, pos, dist, len.min(output_limit.saturating_sub(pos)))?;
+                pos += len.min(output_limit.saturating_sub(pos));
+            } else {
+                if dist > pos {
+                    return Err(Error::codec("lz back-reference out of range")
+                        .with_context(dist as u64));
+                }
+                if pos + len > output_limit {
+                    return Err(Error::limit("lz output over limit"));
+                }
+                let start = pos - dist;
+                for k in 0..len {
+                    let b = buf[start + k];
+                    copy_literal(buf, pos + k, b);
+                }
+                pos += len;
+            }
+        }
+    }
+    scratch.commit(pos);
+    Ok(pos)
+}
+
+#[inline(never)]
+fn copy_literal(buf: &mut [u8], pos: usize, b: u8) {
+    unsafe {
+        *buf.as_mut_ptr().add(pos) = b;
+    }
+}
+
+#[inline(never)]
+fn copy_ref_unchecked(buf: &mut [u8], pos: usize, dist: usize, len: usize) -> Result<()> {
+    let start = pos.wrapping_sub(dist);
+    for k in 0..len {
+        let b = unsafe { *buf.as_ptr().add(start + k) };
+        unsafe {
+            *buf.as_mut_ptr().add(pos + k) = b;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

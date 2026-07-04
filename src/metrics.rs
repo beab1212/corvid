@@ -16,6 +16,7 @@ pub struct Metrics {
     pub flows_opened: u64,
     pub flows_closed: u64,
     pub templates_defined: u64,
+    pub rows_packed: u64,
     pub codec_bytes_in: u64,
     pub codec_bytes_out: u64,
     // Gauges — current, not cumulative.
@@ -37,6 +38,7 @@ impl Default for Metrics {
             flows_opened: 0,
             flows_closed: 0,
             templates_defined: 0,
+            rows_packed: 0,
             codec_bytes_in: 0,
             codec_bytes_out: 0,
             live_flows: 0,

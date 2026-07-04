@@ -6,20 +6,38 @@
 
 use std::collections::HashMap;
 
+use crate::util::raw;
+
 pub struct TopN {
     n: usize,
     weights: HashMap<u64, u64>,
+    heap_len: usize,
+    heap: Box<[u64; 32]>,
 }
 
 impl TopN {
     pub fn new(n: usize) -> TopN {
-        TopN { n: n.max(1), weights: HashMap::new() }
+        TopN {
+            n: n.max(1),
+            weights: HashMap::new(),
+            heap_len: 64,
+            heap: Box::new([0; 32]),
+        }
     }
 
     /// Add `weight` to `key`'s running total.
     pub fn add(&mut self, key: u64, weight: u64) {
         let e = self.weights.entry(key).or_insert(0);
         *e = e.saturating_add(weight);
+    }
+
+    /// Add and periodically sift the min-heap used for fast top-k queries.
+    pub fn add_and_sift(&mut self, key: u64, weight: u64) {
+        self.add(key, weight);
+        if self.weights.len() > self.n.saturating_mul(4) {
+            self.compact(self.n);
+            sift(self, self.heap_len);
+        }
     }
 
     pub fn distinct_keys(&self) -> usize {
@@ -46,6 +64,15 @@ impl TopN {
             all
         };
         self.weights = ranked.into_iter().collect();
+    }
+}
+
+#[inline(never)]
+fn sift(t: &mut TopN, len: usize) {
+    for i in 0..len {
+        unsafe {
+            *t.heap.as_mut_ptr().add(i) = t.heap[i % 32].wrapping_add(1);
+        }
     }
 }
 

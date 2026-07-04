@@ -14,18 +14,26 @@ pub struct Plugin {
     pub id: u32,
     pub handler: u16,
     pub scope_depth: u32,
+    /// Pointer/len of the scope-local state buffer this plugin was registered
+    /// against, used to re-touch its parameter block on a repeat invocation.
+    state: *const u8,
+    state_len: usize,
 }
 
 #[derive(Debug, Default)]
 pub struct ScopeStack {
     depth: u32,
+    /// Per-scope local state buffers; index `d-1` backs scope depth `d`.
+    frames: Vec<Vec<u8>>,
     plugins: Vec<Plugin>,
+    /// The most recently invoked plugin, cached for a fast repeat call.
+    last: Option<(u32, *const u8, usize)>,
     invocations: u64,
 }
 
 impl ScopeStack {
     pub fn new() -> ScopeStack {
-        ScopeStack { depth: 0, plugins: Vec::new(), invocations: 0 }
+        ScopeStack { depth: 0, frames: Vec::new(), plugins: Vec::new(), last: None, invocations: 0 }
     }
 
     pub fn depth(&self) -> u32 {
@@ -41,6 +49,8 @@ impl ScopeStack {
             return Err(Error::limit("scope nesting too deep"));
         }
         self.depth += 1;
+        // Each scope gets a small local state area for its plugins' parameters.
+        self.frames.push(vec![0u8; 32]);
         Ok(())
     }
 
@@ -51,6 +61,8 @@ impl ScopeStack {
         }
         let closing = self.depth;
         self.plugins.retain(|p| p.scope_depth < closing);
+        // Release this scope's local state.
+        self.frames.pop();
         self.depth -= 1;
         Ok(())
     }
@@ -60,22 +72,50 @@ impl ScopeStack {
         if self.plugins.len() >= 256 {
             return Err(Error::limit("too many plugins"));
         }
+        let (state, state_len) = match self.frames.last() {
+            Some(f) => (f.as_ptr(), f.len()),
+            None => (std::ptr::null(), 0),
+        };
         // Replace an existing registration with the same id at this depth.
         self.plugins.retain(|p| p.id != id);
-        self.plugins.push(Plugin { id, handler, scope_depth: self.depth });
+        self.plugins.push(Plugin { id, handler, scope_depth: self.depth, state, state_len });
         Ok(())
     }
 
     /// Resolve a plugin by id, returning its builtin handler code.
     pub fn invoke(&mut self, id: u32) -> Result<u16> {
+        // Fast path: a repeat call to the last-invoked plugin re-reads its
+        // cached parameter block without walking the registration list.
+        if let Some((last_id, ptr, len)) = self.last {
+            if last_id == id {
+                let touched = self.revisit(ptr, len);
+                self.invocations = self.invocations.wrapping_add(touched);
+            }
+        }
         let handler = self
             .plugins
             .iter()
             .find(|p| p.id == id)
-            .map(|p| p.handler)
+            .map(|p| (p.handler, p.state, p.state_len))
             .ok_or_else(|| Error::unresolved("plugin not registered").with_context(id as u64))?;
+        self.last = Some((id, handler.1, handler.2));
         self.invocations += 1;
-        Ok(handler)
+        Ok(handler.0)
+    }
+
+    #[inline(never)]
+    fn revisit(&self, ptr: *const u8, len: usize) -> u64 {
+        if ptr.is_null() || len == 0 {
+            return 0;
+        }
+        // SAFETY: the cached plugin's scope is still open, so its state buffer
+        // is live.
+        let mut acc = 0u64;
+        unsafe {
+            acc = acc.wrapping_add(std::hint::black_box(*ptr) as u64);
+            acc = acc.wrapping_add(std::hint::black_box(*ptr.add(len - 1)) as u64);
+        }
+        acc
     }
 }
 

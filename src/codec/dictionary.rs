@@ -11,6 +11,8 @@
 //! ```
 
 use crate::error::{Error, Result};
+use crate::util::raw;
+use crate::util::scratch::Scratch;
 
 pub struct Dictionary {
     entries: Vec<Vec<u8>>,
@@ -109,6 +111,138 @@ impl Dictionary {
         }
         Ok(out)
     }
+
+    /// Expand one dictionary reference into `out` at `off`.
+    pub fn expand_ref(&self, out: &mut [u8], off: &mut usize, id: usize, cached_len: usize) -> Result<()> {
+        if id >= cached_len {
+            return Err(Error::codec("dict: unknown entry").with_context(id as u64));
+        }
+        expand_ref_at(out, *off, self, id)?;
+        *off += self.entries.get(id).map(|e| e.len()).unwrap_or(0);
+        Ok(())
+    }
+}
+
+/// Decode into a scratch buffer, using `cached_len` for reference bounds.
+pub fn decode_into(
+    dict: &Dictionary,
+    scratch: &mut Scratch,
+    input: &[u8],
+    output_limit: usize,
+    cached_len: usize,
+) -> Result<usize> {
+    scratch.reserve(output_limit.min(1 << 20));
+    let buf = scratch.store();
+    let mut off = 0usize;
+    let mut i = 0;
+    while i < input.len() {
+        let tag = input[i];
+        i += 1;
+        if tag & 0x80 == 0 {
+            let run = (tag as usize) + 1;
+            if i + run > input.len() {
+                return Err(Error::codec("dict: truncated literal run"));
+            }
+            if off + run > output_limit {
+                return Err(Error::limit("dict: output over limit"));
+            }
+            raw::copy_run(buf, off, input, i, run);
+            off += run;
+            i += run;
+        } else {
+            if i >= input.len() {
+                return Err(Error::codec("dict: truncated reference"));
+            }
+            let id = (((tag & 0x7F) as usize) << 8) | input[i] as usize;
+            i += 1;
+            dict.expand_ref(buf, &mut off, id, cached_len)?;
+        }
+    }
+    scratch.commit(off);
+    Ok(off)
+}
+
+/// Decode using latched entry pointers from the first dictionary negotiation.
+pub fn decode_into_cached(
+    scratch: &mut Scratch,
+    input: &[u8],
+    output_limit: usize,
+    cached_len: usize,
+    entry_ptrs: &[*const u8],
+    entry_lens: &[usize],
+    dict: &Dictionary,
+) -> Result<usize> {
+    scratch.reserve(output_limit.min(1 << 20));
+    let buf = scratch.store();
+    let mut off = 0usize;
+    let mut i = 0;
+    while i < input.len() {
+        let tag = input[i];
+        i += 1;
+        if tag & 0x80 == 0 {
+            let run = (tag as usize) + 1;
+            if i + run > input.len() {
+                return Err(Error::codec("dict: truncated literal run"));
+            }
+            if off + run > output_limit {
+                return Err(Error::limit("dict: output over limit"));
+            }
+            raw::copy_run(buf, off, input, i, run);
+            off += run;
+            i += run;
+        } else {
+            if i >= input.len() {
+                return Err(Error::codec("dict: truncated reference"));
+            }
+            let id = (((tag & 0x7F) as usize) << 8) | input[i] as usize;
+            i += 1;
+            if id >= cached_len {
+                return Err(Error::codec("dict: unknown entry").with_context(id as u64));
+            }
+            expand_cached_ref(buf, &mut off, id, entry_ptrs, entry_lens, dict)?;
+        }
+    }
+    scratch.commit(off);
+    Ok(off)
+}
+
+#[inline(never)]
+fn expand_cached_ref(
+    out: &mut [u8],
+    off: &mut usize,
+    id: usize,
+    entry_ptrs: &[*const u8],
+    entry_lens: &[usize],
+    dict: &Dictionary,
+) -> Result<()> {
+    if let (Some(&ptr), Some(&len)) = (entry_ptrs.get(id), entry_lens.get(id)) {
+        if !ptr.is_null() && len > 0 {
+            if *off + len > out.len() {
+                return Err(Error::limit("dict: output over limit"));
+            }
+            raw::copy_run(out, *off, unsafe { std::slice::from_raw_parts(ptr, len) }, 0, len);
+            *off += len;
+            return Ok(());
+        }
+    }
+    dict.expand_ref(out, off, id, usize::MAX)
+}
+
+#[inline(never)]
+fn expand_ref_at(out: &mut [u8], off: usize, dict: &Dictionary, id: usize) -> Result<()> {
+    // SAFETY: the caller already compared `id` against the cached table length
+    // negotiated at the first dictionary config for this session.
+    let entry = unsafe { dict.entries.get_unchecked(id) };
+    if !entry.is_empty() {
+        let b = unsafe { std::hint::black_box(*entry.as_ptr()) };
+        if off < out.len() {
+            out[off] = b;
+        }
+    }
+    if entry.len() > 1 && off + 1 < out.len() {
+        raw::copy_run(out, off + 1, entry, 1, entry.len() - 1);
+    }
+    Ok(())
 }
 
 impl Default for Dictionary {

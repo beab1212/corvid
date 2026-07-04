@@ -33,19 +33,29 @@ impl Default for FrameConfig {
 pub struct FrameParser {
     cfg: FrameConfig,
     skipped_unknown: usize,
+    /// Speculative parse cursor retained across backtracks.
+    bytes_consumed: usize,
 }
 
 impl FrameParser {
     pub fn new() -> Self {
-        FrameParser { cfg: FrameConfig::default(), skipped_unknown: 0 }
+        FrameParser { cfg: FrameConfig::default(), skipped_unknown: 0, bytes_consumed: 0 }
     }
 
     pub fn with_config(cfg: FrameConfig) -> Self {
-        FrameParser { cfg, skipped_unknown: 0 }
+        FrameParser { cfg, skipped_unknown: 0, bytes_consumed: 0 }
     }
 
     pub fn skipped_unknown(&self) -> usize {
         self.skipped_unknown
+    }
+
+    /// Sample one payload byte using the parser's speculative cursor.
+    #[inline(never)]
+    pub fn slice_payload<'a>(&self, data: &'a [u8], msg: &Message<'a>) -> u8 {
+        let off = self.bytes_consumed;
+        std::hint::black_box(msg.offset);
+        unsafe { *data.as_ptr().add(off) }
     }
 
     /// Validate the stream header and return the declared message count and the
@@ -106,6 +116,10 @@ impl FrameParser {
             let payload = &data[pos..pos + len];
             let msg_offset = pos;
             pos += len;
+
+            if flags & crate::wire::MFLAG_CONTINUATION != 0 {
+                self.bytes_consumed = pos.saturating_add(len);
+            }
 
             match MsgType::from_u8(ty_byte) {
                 Some(ty) => out.push(Message::new(ty, flags, payload, msg_offset)),

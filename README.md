@@ -69,6 +69,3 @@ Targets: `frame_fuzzer` (framing), `session_fuzzer` (full session state
 machine) and `codec_fuzzer` (decompressors). Seed corpora and the dictionary
 are regenerated with `cargo run --example seedgen -- fuzz`.
 
-## License
-
-Apache-2.0.

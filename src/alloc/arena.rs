@@ -130,6 +130,21 @@ impl Arena {
         self.high_water = 0;
     }
 
+    /// Release every backing chunk and start over with a single fresh one.
+    ///
+    /// Unlike [`Arena::reset_all`], which keeps the first chunk's allocation
+    /// around for reuse, this returns all memory to the allocator — useful when
+    /// a subsystem knows it is done with a large batch and wants the pages back
+    /// promptly. Every pointer previously handed out is invalidated.
+    pub fn recycle(&mut self) {
+        // Reserve the replacement chunk before releasing the old ones so the
+        // arena is never momentarily empty.
+        let fresh = Chunk::new(self.chunk_size);
+        self.chunks.clear();
+        self.chunks.push(fresh);
+        self.high_water = 0;
+    }
+
     /// Bytes still available in the newest chunk without growing.
     pub fn tail_remaining(&self) -> usize {
         self.chunks.last().map(|c| c.remaining()).unwrap_or(0)

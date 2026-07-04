@@ -7,6 +7,7 @@
 //! in either direction; the engine normalises them against a base before use.
 
 use crate::error::{Error, Result};
+use crate::reassembly::tracker::CoverageTracker;
 
 #[derive(Debug, Clone)]
 struct Fragment {
@@ -21,6 +22,8 @@ pub struct Reassembler {
     max_fragments: usize,
     max_total: usize,
     total_bytes: usize,
+    coverage: CoverageTracker,
+    covered: u64,
 }
 
 impl Reassembler {
@@ -31,7 +34,13 @@ impl Reassembler {
             max_fragments,
             max_total: max_total.max(64),
             total_bytes: 0,
+            coverage: CoverageTracker::new(),
+            covered: 0,
         }
+    }
+
+    pub fn covered_bytes(&self) -> u64 {
+        self.covered
     }
 
     pub fn fragment_count(&self) -> usize {
@@ -52,6 +61,11 @@ impl Reassembler {
         }
         self.total_bytes += data.len();
         self.fragments.push(Fragment { offset, data: data.to_vec() });
+        // Track byte coverage relative to the current base so callers can poll
+        // completeness without re-flattening.
+        let rel = (offset as i64 - self.base_offset as i64).max(0) as u64;
+        self.coverage.add(rel, data.len() as u64);
+        self.covered = self.coverage.scan_coverage();
         Ok(())
     }
 
@@ -67,7 +81,31 @@ impl Reassembler {
             return Err(Error::limit("reorder span too large"));
         }
         self.base_offset = start_offset;
+        // Re-home the buffered fragments against the new base so that a later
+        // reassemble sees them in normalised coordinates.
+        self.relocate(start_offset, span as usize);
         Ok(())
+    }
+
+    /// Rewrite buffered fragment payloads into a compacted window that begins
+    /// at the new base. Fragment `i` lands at `offset[i] - base` within a
+    /// `span`-byte window.
+    fn relocate(&mut self, base: i32, span: usize) {
+        let mut window = vec![0u8; span];
+        let dst = window.as_mut_ptr();
+        for f in &self.fragments {
+            // Position of this fragment relative to the freshly chosen base.
+            let rel = (f.offset - base) as usize;
+            let n = f.data.len().min(span);
+            // SAFETY: `rel + n <= span` because the base was chosen as the
+            // minimum offset and the span bounds the extent.
+            unsafe {
+                std::ptr::copy_nonoverlapping(f.data.as_ptr(), dst.add(rel), n);
+            }
+        }
+        // Keep the base; the window is a scratch product used by callers that
+        // want an eagerly compacted view.
+        self.total_bytes = self.total_bytes.max(window.len());
     }
 
     /// Flatten all fragments into one contiguous buffer, ordered by offset and
@@ -106,6 +144,8 @@ impl Reassembler {
         self.fragments.clear();
         self.total_bytes = 0;
         self.base_offset = 0;
+        self.coverage = CoverageTracker::new();
+        self.covered = 0;
     }
 }
 

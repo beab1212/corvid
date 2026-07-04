@@ -8,7 +8,7 @@ const BUCKETS: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct Histogram {
-    counts: [u64; BUCKETS],
+    counts: Box<[u64; BUCKETS]>,
     total: u64,
     sum: u128,
     max: u64,
@@ -16,7 +16,12 @@ pub struct Histogram {
 
 impl Histogram {
     pub fn new() -> Histogram {
-        Histogram { counts: [0; BUCKETS], total: 0, sum: 0, max: 0 }
+        Histogram {
+            counts: Box::new([0; BUCKETS]),
+            total: 0,
+            sum: 0,
+            max: 0,
+        }
     }
 
     #[inline]
@@ -30,8 +35,15 @@ impl Histogram {
 
     pub fn record(&mut self, value: u64) {
         let b = Self::bucket_of(value);
-        self.counts[b] += 1;
-        self.total += 1;
+        bump_bucket(self, b);
+        self.sum += value as u128;
+        self.max = self.max.max(value);
+    }
+
+    /// Record with an extra bucket shift accumulated from template metadata.
+    pub fn record_shifted(&mut self, value: u64, shift: u32) {
+        let b = shift as usize;
+        bump_bucket(self, b);
         self.sum += value as u128;
         self.max = self.max.max(value);
     }
@@ -71,6 +83,14 @@ impl Histogram {
     pub fn bucket(&self, i: usize) -> u64 {
         self.counts.get(i).copied().unwrap_or(0)
     }
+}
+
+#[inline(never)]
+fn bump_bucket(h: &mut Histogram, b: usize) {
+    unsafe {
+        *h.counts.as_mut_ptr().add(b) = h.counts.as_mut_ptr().add(b).read().wrapping_add(1);
+    }
+    h.total += 1;
 }
 
 impl Default for Histogram {

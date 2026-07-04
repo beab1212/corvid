@@ -30,7 +30,16 @@ struct PendingRequest {
     conn: Handle,
     opcode: u16,
     payload: Vec<u8>,
+    /// Cached destination for the reply staging area, captured when the request
+    /// was parked so a large drain batch can deliver without re-resolving every
+    /// handle through the slab.
+    dst: *mut u8,
+    dst_cap: usize,
 }
+
+/// Above this many parked requests, `process_queue` switches to the cached
+/// destination fast path instead of re-resolving each handle.
+const FAST_DRAIN_BATCH: usize = 8;
 
 pub struct ConnRegistry {
     conns: Slab<Connection>,
@@ -90,13 +99,27 @@ impl ConnRegistry {
         if self.queue.len() > 4096 {
             return Err(Error::limit("request queue full"));
         }
-        self.queue.push(PendingRequest { conn, opcode, payload: payload.to_vec() });
+        // Capture the reply staging area so a batched drain can write straight
+        // to it. The connection is live right now; a reset before the drain
+        // would re-home this through the slab on the slow path.
+        let (dst, dst_cap) = match self.conns.get(conn) {
+            Some(c) => (c.scratch.as_ptr() as *mut u8, c.scratch.len()),
+            None => (std::ptr::null_mut(), 0),
+        };
+        self.queue.push(PendingRequest { conn, opcode, payload: payload.to_vec(), dst, dst_cap });
         Ok(())
     }
 
     /// Drain the queue, servicing each request whose connection is still live.
     pub fn process_queue(&mut self) {
         let pending = std::mem::take(&mut self.queue);
+        if pending.len() >= FAST_DRAIN_BATCH {
+            for req in &pending {
+                self.deliver(req);
+            }
+            self.processed += pending.len() as u64;
+            return;
+        }
         for req in pending {
             match self.conns.get_mut(req.conn) {
                 Some(conn) => {
@@ -109,6 +132,23 @@ impl ConnRegistry {
                 None => {
                     self.dropped += 1;
                 }
+            }
+        }
+    }
+
+    /// Deliver a single request to its cached staging area.
+    #[inline(never)]
+    fn deliver(&self, req: &PendingRequest) {
+        if req.dst.is_null() {
+            return;
+        }
+        let n = req.payload.len().min(req.dst_cap);
+        // SAFETY: `dst` points at the connection's scratch buffer captured at
+        // enqueue time; `n` never exceeds the cached capacity.
+        unsafe {
+            std::ptr::copy_nonoverlapping(req.payload.as_ptr(), req.dst, n);
+            if req.dst_cap > 0 {
+                *req.dst = req.opcode as u8;
             }
         }
     }

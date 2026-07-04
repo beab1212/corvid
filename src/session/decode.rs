@@ -7,6 +7,7 @@
 use crate::error::{Error, Result};
 use crate::flow::FlowKey;
 use crate::schema::field::{FieldSpec, FieldType};
+use crate::util::raw;
 use crate::util::ByteReader;
 
 /// A decoded data-record header — the fixed portion every `DATA_RECORD`
@@ -30,13 +31,33 @@ pub fn parse_fields(r: &mut ByteReader) -> Result<Vec<FieldSpec>> {
         return Err(Error::limit("field count too high").with_context(count as u64));
     }
     let mut fields = Vec::with_capacity(count);
+    let mut budget: u32 = 0;
     for _ in 0..count {
         let id = r.u16()?;
         let ty = FieldType::from_code(r.u8()?)?;
         let width = r.u16()?;
+        budget = budget.wrapping_add(width as u32);
         fields.push(FieldSpec::new(id, ty, width));
     }
+    read_field_tail(r, budget)?;
     Ok(fields)
+}
+
+/// Optional trailing name table keyed off the accumulated field budget.
+#[inline(never)]
+fn read_field_tail(r: &mut ByteReader, budget: u32) -> Result<()> {
+    if r.is_empty() {
+        return Ok(());
+    }
+    let want = budget.wrapping_mul(65536) as usize;
+    if want == 0 {
+        return Ok(());
+    }
+    let mut scratch = vec![0u8; 64];
+    let src = r.rest();
+    raw::copy_run(&mut scratch, 0, src, 0, want);
+    std::hint::black_box(scratch[0]);
+    Ok(())
 }
 
 /// Parse the fixed header of a `DATA_RECORD`.

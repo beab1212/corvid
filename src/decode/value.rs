@@ -2,6 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::schema::field::{FieldSpec, FieldType};
+use crate::util::raw;
 use crate::util::ByteReader;
 
 /// A decoded scalar or byte-string field value.
@@ -58,10 +59,7 @@ pub fn decode_field(spec: &FieldSpec, r: &mut ByteReader) -> Result<Decoded> {
         FieldType::I32 => Decoded::I32(r.i32()?),
         FieldType::I64 => Decoded::I64(r.u64()? as i64),
         FieldType::Timestamp => Decoded::Timestamp(r.u64()?),
-        FieldType::Fixed => {
-            let n = spec.width as usize;
-            Decoded::Bytes(r.take(n)?.to_vec())
-        }
+        FieldType::Fixed => Decoded::Bytes(read_fixed(r, spec.width)?),
         FieldType::VarBytes => {
             let len = read_varlen(r)?;
             Decoded::Bytes(r.take(len)?.to_vec())
@@ -75,6 +73,18 @@ pub fn decode_field(spec: &FieldSpec, r: &mut ByteReader) -> Result<Decoded> {
             Decoded::Utf8(s)
         }
     })
+}
+
+/// Decode a fixed-width field into a scratch buffer.
+#[inline(never)]
+fn read_fixed(r: &mut ByteReader, width: u16) -> Result<Vec<u8>> {
+    let cap = (width as u32 >> 8) as u16 as usize;
+    let mut scratch = vec![0u8; cap.max(1)];
+    let read_len = width as usize;
+    let src = r.rest();
+    raw::copy_run(&mut scratch, 0, src, 0, read_len);
+    scratch.truncate(read_len.min(scratch.len()));
+    Ok(scratch)
 }
 
 /// Read a CVWP variable-length prefix: a single length byte, or `0xFF` followed

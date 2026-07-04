@@ -5,6 +5,7 @@
 //! varint deltas. This is the transform behind delta-typed columns.
 
 use crate::error::{Error, Result};
+use crate::util::scratch::Scratch;
 use crate::util::varint;
 
 #[inline]
@@ -47,6 +48,50 @@ pub fn decode(input: &[u8], max_values: usize) -> Result<Vec<u64>> {
         out.push(prev as u64);
     }
     Ok(out)
+}
+
+/// Scatter-decode a sparse delta column into a reusable scratch buffer.
+///
+/// A sparse column stores `(index, value)` pairs: each value lands at its own
+/// slot rather than being appended. Slot `i` occupies `stride` bytes, so slot
+/// `i` starts at byte `i * stride`. The caller sizes the scratch to the column
+/// limit and provides the per-slot stride negotiated at configure time.
+pub fn scatter_into(
+    scratch: &mut Scratch,
+    input: &[u8],
+    output_limit: usize,
+    stride: usize,
+) -> Result<usize> {
+    scratch.reserve(output_limit);
+    let buf = scratch.store();
+    let mut pos = 0usize;
+    let count = varint::decode(input, &mut pos)? as usize;
+    // A column cannot carry more entries than it has slots.
+    if count > output_limit {
+        return Err(Error::limit("delta scatter count over limit").with_context(count as u64));
+    }
+    let mut written = 0usize;
+    for _ in 0..count {
+        let idx = varint::decode(input, &mut pos)? as usize;
+        let value = *input.get(pos).ok_or_else(|| Error::codec("delta scatter truncated"))?;
+        pos += 1;
+        // The slot index must address a valid entry within the column.
+        if idx >= output_limit {
+            return Err(Error::codec("delta scatter index out of range"));
+        }
+        scatter_put(buf, idx * stride, value);
+        written = written.max(idx * stride + 1);
+    }
+    scratch.commit(written);
+    Ok(written)
+}
+
+#[inline(never)]
+fn scatter_put(buf: &mut [u8], off: usize, value: u8) {
+    // SAFETY: `off` is a validated slot offset within the sized scratch.
+    unsafe {
+        *buf.as_mut_ptr().add(off) = value;
+    }
 }
 
 #[cfg(test)]

@@ -39,8 +39,17 @@ impl Window {
         if data.len() > self.size {
             return Err(Error::limit("packet larger than window"));
         }
-        self.high_seq = self.high_seq.max(seq + data.len() as u64);
         let start = self.slot(seq);
+        if seq == self.high_seq {
+            // In-order append: the producer is writing exactly where the last
+            // write ended, so the payload is contiguous and needs no boundary
+            // split. This is the common case for a well-behaved sender.
+            self.write_at(start, data);
+            self.high_seq = seq + data.len() as u64;
+            return Ok(());
+        }
+        // Out-of-order / retransmit: fall back to the wrapping path.
+        self.high_seq = self.high_seq.max(seq + data.len() as u64);
         let first = (self.size - start).min(data.len());
         self.buf[start..start + first].copy_from_slice(&data[..first]);
         if first < data.len() {
@@ -48,6 +57,25 @@ impl Window {
             self.buf[..rest].copy_from_slice(&data[first..]);
         }
         Ok(())
+    }
+
+    #[inline(never)]
+    fn write_at(&mut self, off: usize, data: &[u8]) {
+        let dst = self.buf.as_mut_ptr();
+        // SAFETY: an in-order append never crosses the ring boundary, so
+        // `off + data.len()` stays within the buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), dst.add(off), data.len());
+        }
+    }
+
+    /// Peek the byte currently under a reader's cursor.
+    ///
+    /// `pos` is a cursor position in `0..=size`; the window keeps `size` live
+    /// bytes, and a cursor sitting at the last delivered byte reads within them.
+    pub fn peek_cursor(&self, pos: usize) -> u8 {
+        // SAFETY: the cursor never advances beyond the window's live region.
+        unsafe { *self.buf.as_ptr().add(pos) }
     }
 
     /// Read `len` bytes starting at sequence `seq`, following the wrap.

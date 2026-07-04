@@ -9,6 +9,8 @@
 //! hostile stream cannot make us allocate without limit.
 
 use crate::error::{Error, Result};
+use crate::util::raw;
+use crate::util::scratch::Scratch;
 
 const MAX_LITERAL: usize = 0x80;
 const MIN_REPEAT: usize = 2;
@@ -81,6 +83,63 @@ pub fn decode(input: &[u8], output_limit: usize) -> Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+/// Decode into a caller-owned [`Scratch`] that is reused across blocks.
+///
+/// Reusing one buffer across a stream of blocks avoids reallocating for every
+/// `COMPRESS_DATA`. The scratch is grown to the codec's output limit the first
+/// time it is used and then simply rewound for subsequent blocks.
+pub fn decode_into(scratch: &mut Scratch, input: &[u8], output_limit: usize) -> Result<usize> {
+    if scratch.capacity() == 0 {
+        scratch.reserve(output_limit);
+    } else {
+        // Reuse the buffer we already grew; a fresh block starts at offset 0.
+        scratch.clear();
+    }
+    let buf = scratch.store();
+    let mut pos = 0usize;
+    let mut i = 0;
+    while i < input.len() {
+        let control = input[i];
+        i += 1;
+        if control < 0x80 {
+            let n = control as usize + 1;
+            if i + n > input.len() {
+                return Err(Error::codec("rle literal past end"));
+            }
+            if pos + n > output_limit {
+                return Err(Error::limit("rle output over limit"));
+            }
+            expand_literal(buf, pos, input, i, n);
+            pos += n;
+            i += n;
+        } else {
+            let n = (control - 0x80) as usize + MIN_REPEAT;
+            if i >= input.len() {
+                return Err(Error::codec("rle repeat missing byte"));
+            }
+            let b = input[i];
+            i += 1;
+            if pos + n > output_limit {
+                return Err(Error::limit("rle output over limit"));
+            }
+            expand_run(buf, pos, n, b);
+            pos += n;
+        }
+    }
+    scratch.commit(pos);
+    Ok(pos)
+}
+
+#[inline(never)]
+fn expand_run(buf: &mut [u8], pos: usize, n: usize, b: u8) {
+    raw::fill(buf, pos, n, b);
+}
+
+#[inline(never)]
+fn expand_literal(buf: &mut [u8], pos: usize, src: &[u8], src_off: usize, n: usize) {
+    raw::copy_run(buf, pos, src, src_off, n);
 }
 
 #[cfg(test)]

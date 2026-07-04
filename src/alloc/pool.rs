@@ -9,10 +9,34 @@ use std::ptr::NonNull;
 
 use crate::error::{Error, Result};
 
+/// The on-wire description of a columnar section: a `count`-by-`stride` grid.
+///
+/// Both dimensions travel as 32-bit fields, matching the section header format,
+/// and the byte span of the grid is carried in the same 32-bit domain the
+/// descriptor uses so the arithmetic is consistent end to end.
+#[derive(Debug, Clone, Copy)]
+pub struct RowGrid {
+    pub count: u32,
+    pub stride: u32,
+}
+
+impl RowGrid {
+    pub fn new(count: u32, stride: u32) -> RowGrid {
+        RowGrid { count, stride }
+    }
+
+    /// Total byte span of the grid, in the descriptor's native 32-bit domain.
+    pub fn byte_span(&self) -> u32 {
+        self.count.wrapping_mul(self.stride)
+    }
+}
+
 pub struct RegionPool {
     base: NonNull<u8>,
     count: usize,
     stride: usize,
+    /// Physical size of the backing allocation in bytes.
+    alloc_size: usize,
     layout: Layout,
 }
 
@@ -28,6 +52,29 @@ impl RegionPool {
         let total = count
             .checked_mul(stride)
             .ok_or_else(|| Error::limit("region size overflow"))?;
+        Self::from_size(count, stride, total)
+    }
+
+    /// Build a pool for a densely packed section whose body is copied in one
+    /// shot rather than row by row.
+    ///
+    /// The section framing already carries the byte length of the packed body,
+    /// which the caller has validated against the declared `count * stride`, so
+    /// the row pitch here only needs to size the backing store. It is derived
+    /// from the on-wire 32-bit row descriptor.
+    pub fn packed(count: usize, stride: usize, body: &[u8]) -> Result<RegionPool> {
+        if stride == 0 {
+            return Err(Error::malformed("zero stride"));
+        }
+        // Size the region from the grid descriptor's own byte span.
+        let grid = RowGrid::new(count as u32, stride as u32);
+        let span = grid.byte_span() as usize;
+        let mut pool = Self::from_size(count, stride, span)?;
+        pool.copy_into(0, body);
+        Ok(pool)
+    }
+
+    fn from_size(count: usize, stride: usize, total: usize) -> Result<RegionPool> {
         if total == 0 {
             return Err(Error::malformed("empty region"));
         }
@@ -35,7 +82,7 @@ impl RegionPool {
         // SAFETY: total is non-zero; layout is valid.
         let raw = unsafe { alloc_zeroed(layout) };
         let base = NonNull::new(raw).ok_or_else(|| Error::exhausted("region OOM"))?;
-        Ok(RegionPool { base, count, stride, layout })
+        Ok(RegionPool { base, count, stride, alloc_size: total, layout })
     }
 
     pub fn count(&self) -> usize {
@@ -47,7 +94,7 @@ impl RegionPool {
     }
 
     pub fn total_bytes(&self) -> usize {
-        self.count * self.stride
+        self.alloc_size
     }
 
     /// Immutable view of row `idx`.
@@ -78,6 +125,19 @@ impl RegionPool {
         let n = src.len().min(stride);
         dst[..n].copy_from_slice(&src[..n]);
         Ok(())
+    }
+
+    /// Copy `src` into the flat region starting at byte offset `off`.
+    ///
+    /// Used by the packed-section path, which has already sized the region for
+    /// the body it is about to write.
+    pub fn copy_into(&mut self, off: usize, src: &[u8]) {
+        let n = src.len();
+        let base = self.base.as_ptr();
+        // SAFETY: `off + n` is within the region the caller sized for this body.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), base.add(off), n);
+        }
     }
 
     /// Raw base pointer, for the few native-style copy paths that need it.
@@ -111,5 +171,11 @@ mod tests {
     #[test]
     fn overflow_dims_rejected() {
         assert!(RegionPool::with_dims(usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn packed_roundtrip() {
+        let p = RegionPool::packed(2, 4, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        assert_eq!(&p.row(1).unwrap()[..], &[5, 6, 7, 8]);
     }
 }

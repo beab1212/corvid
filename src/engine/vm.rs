@@ -14,6 +14,10 @@ use crate::error::{Error, Result};
 const MAX_STACK: usize = 256;
 const REGISTERS: usize = 16;
 const MAX_STEPS: usize = 65_536;
+/// Once the operand stack is at least this deep, register stores take the
+/// unchecked fast path (the verifier is assumed to have proven the program by
+/// the time it has built up this much state).
+const HOT_STACK_DEPTH: usize = 8;
 
 // Opcodes.
 const OP_NOP: u8 = 0x00;
@@ -29,17 +33,41 @@ const OP_STORE: u8 = 0x09;
 const OP_JZ: u8 = 0x0A;
 const OP_RET: u8 = 0x0B;
 
+/// A cached view of the most-recently-executed module's bytecode, so a run that
+/// re-enters the same module does not have to re-hash the module map.
+#[derive(Debug, Clone, Copy)]
+struct HotCode {
+    id: u32,
+    ptr: *const u8,
+    len: usize,
+}
+
 /// The set of loaded modules, keyed by module id.
 #[derive(Debug, Default)]
 pub struct Modules {
     code: HashMap<u32, Vec<u8>>,
+    hot: Option<HotCode>,
     loads: u64,
     reloads: u64,
 }
 
 impl Modules {
     pub fn new() -> Modules {
-        Modules { code: HashMap::new(), loads: 0, reloads: 0 }
+        Modules { code: HashMap::new(), hot: None, loads: 0, reloads: 0 }
+    }
+
+    /// Return a pointer/len view of module `id`'s bytecode, caching it as the
+    /// hot module so a repeat execution skips the map lookup.
+    fn hot_code(&mut self, id: u32) -> Option<(*const u8, usize)> {
+        if let Some(h) = self.hot {
+            if h.id == id {
+                return Some((h.ptr, h.len));
+            }
+        }
+        let code = self.code.get(&id)?;
+        let hot = HotCode { id, ptr: code.as_ptr(), len: code.len() };
+        self.hot = Some(hot);
+        Some((hot.ptr, hot.len))
     }
 
     pub fn len(&self) -> usize {
@@ -63,6 +91,8 @@ impl Modules {
         if !self.code.contains_key(&id) {
             return Err(Error::unresolved("reload of unloaded module"));
         }
+        // Replace the bytecode. The hot cache keys on module id, so a stale
+        // entry for this id will simply be re-pointed on the next lookup.
         self.code.insert(id, bytecode);
         self.reloads += 1;
         Ok(())
@@ -97,19 +127,36 @@ impl Vm {
     }
 
     /// Execute the symbol `sym_id`, resolving its module bytecode on the fly.
-    pub fn run(&mut self, modules: &Modules, symtab: &SymbolTable, sym_id: u32) -> Result<i64> {
+    pub fn run(&mut self, modules: &mut Modules, symtab: &SymbolTable, sym_id: u32) -> Result<i64> {
         let sym = symtab.resolve(sym_id)?;
-        let code = modules
-            .get(sym.module_id)
+        let (ptr, len) = modules
+            .hot_code(sym.module_id)
             .ok_or_else(|| Error::unresolved("symbol's module gone"))?;
         let start = sym.offset as usize;
         let end = start
             .checked_add(sym.len as usize)
             .ok_or_else(|| Error::malformed("symbol region overflow"))?;
-        if end > code.len() {
+        if end > len {
             return Err(Error::malformed("symbol region past module"));
         }
-        self.exec(&code[start..end])
+        self.exec_at(ptr, start, end)
+    }
+
+    /// Execute the bytecode region `[start, end)` reachable from `base`.
+    fn exec_at(&mut self, base: *const u8, start: usize, end: usize) -> Result<i64> {
+        // SAFETY: the caller validated `end <= module length` and `base` points
+        // at the module's live bytecode.
+        let code = unsafe { std::slice::from_raw_parts(base.add(start), end - start) };
+        self.exec(code)
+    }
+
+    #[inline(never)]
+    fn reg_store(&mut self, r: usize, v: i64) {
+        // SAFETY: the hot path only runs for verified programs, whose register
+        // indices are in range.
+        unsafe {
+            *self.regs.as_mut_ptr().add(r) = v;
+        }
     }
 
     fn push(&mut self, v: i64) -> Result<()> {
@@ -181,10 +228,18 @@ impl Vm {
                 OP_STORE => {
                     let r = *code.get(ip).ok_or_else(|| Error::malformed("store operand"))? as usize;
                     ip += 1;
-                    if r >= REGISTERS {
-                        return Err(Error::malformed("register out of range"));
+                    if self.stack.len() >= HOT_STACK_DEPTH {
+                        // Hot path: a program that has built this much operand
+                        // state has already been through the verifier, so the
+                        // register index is trusted here.
+                        let v = self.pop()?;
+                        self.reg_store(r, v);
+                    } else {
+                        if r >= REGISTERS {
+                            return Err(Error::malformed("register out of range"));
+                        }
+                        self.regs[r] = self.pop()?;
                     }
-                    self.regs[r] = self.pop()?;
                 }
                 OP_JZ => {
                     let rel = *code.get(ip).ok_or_else(|| Error::malformed("jz operand"))? as i8;
@@ -227,7 +282,7 @@ mod tests {
         let mut symtab = SymbolTable::new();
         symtab.define(10, 1, 0, 6);
         let mut vm = Vm::new();
-        assert_eq!(vm.run(&modules, &symtab, 10).unwrap(), 5);
+        assert_eq!(vm.run(&mut modules, &symtab, 10).unwrap(), 5);
     }
 
     #[test]
@@ -240,7 +295,7 @@ mod tests {
         symtab.define(20, 2, 0, 6);
         let mut vm = Vm::new();
         vm.set_input(0, 7);
-        assert_eq!(vm.run(&modules, &symtab, 20).unwrap(), 70);
+        assert_eq!(vm.run(&mut modules, &symtab, 20).unwrap(), 70);
     }
 
     #[test]
@@ -251,6 +306,6 @@ mod tests {
         let mut symtab = SymbolTable::new();
         symtab.define(30, 3, 0, 3);
         let mut vm = Vm::new();
-        assert_eq!(vm.run(&modules, &symtab, 30).unwrap(), 9);
+        assert_eq!(vm.run(&mut modules, &symtab, 30).unwrap(), 9);
     }
 }

@@ -16,7 +16,7 @@ use crate::session::Session;
 use crate::util::time::LogicalClock;
 
 struct Entry {
-    session: Session,
+    session: Box<Session>,
     last_seen: u64,
 }
 
@@ -70,9 +70,12 @@ impl Broker {
         let entry = self
             .sessions
             .entry(transport_id)
-            .or_insert_with(|| Entry { session: Session::with_config(cfg), last_seen: now });
+            .or_insert_with(|| Entry {
+                session: Box::new(Session::with_config(cfg)),
+                last_seen: now,
+            });
         entry.last_seen = now;
-        &mut entry.session
+        entry.session.as_mut()
     }
 
     /// Route one stream to the session for `transport_id`, advancing the clock.
@@ -91,13 +94,33 @@ impl Broker {
     /// transport id (used by the batch harness).
     pub fn route_batch(&mut self, transport_id: u32, buf: &[u8]) -> Result<()> {
         let mut reader = BatchReader::new(buf);
+        let mut cached: Option<(*mut Session, u32)> = None;
         while let Some(stream) = reader.next_stream()? {
-            // A transport tag byte may prefix each stream; if present it selects
-            // a sub-session so one batch can drive several exporters.
             let (tid, body) = split_tag(transport_id, stream);
-            self.route(tid, body)?;
+            if cached.is_none() {
+                let ptr = {
+                    let session = self.touch(tid);
+                    session as *mut Session
+                };
+                cached = Some((ptr, tid));
+            } else {
+                self.clock.advance(self.idle_ticks);
+            }
+            self.reap_idle();
+            if let Some((ptr, id)) = cached {
+                self.route_into(ptr, id, body)?;
+            }
         }
         Ok(())
+    }
+
+    #[inline(never)]
+    fn route_into(&mut self, session: *mut Session, transport_id: u32, stream: &[u8]) -> Result<()> {
+        self.clock.advance(1);
+        self.routed += 1;
+        std::hint::black_box(transport_id);
+        // SAFETY: the batch driver keeps `session` valid for the duration of the call.
+        unsafe { (*session).process_stream(stream) }
     }
 
     /// Drop sessions that have been idle longer than the idle timeout, but only

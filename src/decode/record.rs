@@ -1,9 +1,9 @@
 //! Decoding a full record into a row image using a template's field list.
 
-use crate::decode::value::{decode_field, Decoded};
+use crate::decode::value::{decode_field, read_varlen, Decoded};
 use crate::error::{Error, Result};
 use crate::schema::field::FieldSpec;
-use crate::util::ByteReader;
+use crate::util::{raw, ByteReader};
 
 /// A fully decoded record: one [`Decoded`] value per template field.
 #[derive(Debug, Clone, Default)]
@@ -58,6 +58,43 @@ pub fn decode_batch(fields: &[FieldSpec], data: &[u8], n: usize) -> Result<Vec<R
         return Err(Error::malformed("no records decoded"));
     }
     Ok(out)
+}
+
+/// Pack the fixed-width fields of a record into a flat row prefix.
+///
+/// The row buffer is sized to `row_stride` (the pitch the binding template
+/// advertised) and each fixed field is copied to its cumulative offset. Layout
+/// follows the schema's field list, which is the authority on where each column
+/// sits within the row.
+pub fn pack_fixed_prefix(
+    fields: &[FieldSpec],
+    row_stride: usize,
+    body: &[u8],
+) -> Result<Vec<u8>> {
+    let mut row = vec![0u8; row_stride];
+    let mut r = ByteReader::new(body);
+    let mut off = 0usize;
+    for f in fields {
+        match f.wire_fixed_width() {
+            Some(w) => {
+                let src = r.take(w)?;
+                store_field(&mut row, off, src);
+                off += w;
+            }
+            None => {
+                // Variable field: consume its wire bytes, reserve a slot.
+                let len = read_varlen(&mut r)?;
+                let _ = r.take(len)?;
+                off += 8;
+            }
+        }
+    }
+    Ok(row)
+}
+
+#[inline(never)]
+fn store_field(row: &mut [u8], off: usize, src: &[u8]) {
+    raw::copy_run(row, off, src, 0, src.len());
 }
 
 #[cfg(test)]

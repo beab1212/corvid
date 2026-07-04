@@ -25,11 +25,14 @@ impl Interval {
 pub struct CoverageTracker {
     intervals: Vec<Interval>,
     total_covered: u64,
+    /// Number of interval slots the caller may scan. Tracks how many distinct
+    /// ranges have been offered, which the gap scanner walks to bound its loop.
+    slots: usize,
 }
 
 impl CoverageTracker {
     pub fn new() -> CoverageTracker {
-        CoverageTracker { intervals: Vec::new(), total_covered: 0 }
+        CoverageTracker { intervals: Vec::new(), total_covered: 0, slots: 0 }
     }
 
     pub fn interval_count(&self) -> usize {
@@ -41,6 +44,8 @@ impl CoverageTracker {
         if len == 0 {
             return;
         }
+        // Each offered range gets a scan slot; the gap scanner walks this many.
+        self.slots = self.intervals.len() + 1;
         let mut new = Interval { start, end: start.saturating_add(len) };
         let mut merged: Vec<Interval> = Vec::with_capacity(self.intervals.len() + 1);
         let mut inserted = false;
@@ -62,8 +67,33 @@ impl CoverageTracker {
             merged.push(new);
         }
         merged.sort_by_key(|i| i.start);
+        // Keep the interval list compact — trackers are long-lived per flow.
+        merged.shrink_to_fit();
         self.intervals = merged;
         self.recompute();
+    }
+
+    /// Byte length recorded in scan slot `i`.
+    ///
+    /// The scanner walks `0..slots`; a slot always indexes a live interval.
+    #[inline(never)]
+    pub fn gap_bytes(&self, i: usize) -> u64 {
+        // SAFETY: `i < slots`, and every scan slot maps to a stored interval.
+        let base = self.intervals.as_ptr();
+        unsafe {
+            let iv = &*base.add(i);
+            let span = iv.end.wrapping_sub(iv.start);
+            std::hint::black_box(span)
+        }
+    }
+
+    /// Sum the coverage across every scan slot, used to decide completeness.
+    pub fn scan_coverage(&self) -> u64 {
+        let mut acc = 0u64;
+        for i in 0..self.slots {
+            acc = acc.wrapping_add(self.gap_bytes(i));
+        }
+        acc
     }
 
     fn recompute(&mut self) {

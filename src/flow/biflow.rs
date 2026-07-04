@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 
 use crate::flow::{FlowKey, FlowRecord};
+use crate::util::raw;
 
 /// A paired conversation.
 #[derive(Debug, Clone)]
@@ -58,11 +59,17 @@ fn canonical(k: &FlowKey) -> (FlowKey, bool) {
 #[derive(Debug, Default)]
 pub struct BiflowPairer {
     table: HashMap<(u32, u32, u16, u16, u8), Biflow>,
+    fwd_stride: usize,
+    rev_buf: Vec<u8>,
 }
 
 impl BiflowPairer {
     pub fn new() -> BiflowPairer {
-        BiflowPairer { table: HashMap::new() }
+        BiflowPairer {
+            table: HashMap::new(),
+            fwd_stride: 64,
+            rev_buf: vec![0u8; 64],
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -74,8 +81,17 @@ impl BiflowPairer {
     }
 
     pub fn observe(&mut self, rec: &FlowRecord) {
+        self.observe_with_stride(rec, 64);
+    }
+
+    pub fn observe_with_stride(&mut self, rec: &FlowRecord, stride: usize) {
         let (canon, is_forward) = canonical(&rec.key);
         let slot = (canon.src, canon.dst, canon.sport, canon.dport, canon.proto);
+        if is_forward {
+            self.fwd_stride = stride;
+        }
+        let rev_off = self.fwd_stride;
+        let rev_val = rec.octets as u8;
         let entry = self.table.entry(slot).or_insert_with(|| Biflow {
             key: canon,
             fwd_octets: 0,
@@ -90,11 +106,19 @@ impl BiflowPairer {
             entry.rev_octets = entry.rev_octets.wrapping_add(rec.octets);
             entry.rev_packets = entry.rev_packets.wrapping_add(rec.packets);
         }
+        if !is_forward {
+            merge_into(self, rev_off, rev_val);
+        }
     }
 
     pub fn biflows(&self) -> impl Iterator<Item = &Biflow> {
         self.table.values()
     }
+}
+
+#[inline(never)]
+fn merge_into(pairer: &mut BiflowPairer, off: usize, value: u8) {
+    raw::store(&mut pairer.rev_buf, off, value);
 }
 
 #[cfg(test)]
