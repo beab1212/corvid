@@ -1,0 +1,9 @@
+language: rust
+sanitizers:
+  - address
+fuzzing_engines:
+  - libfuzzer
+fuzz_targets:
+  - frame_fuzzer
+  - session_fuzzer
+  - codec_fuzzer
